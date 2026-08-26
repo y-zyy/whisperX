@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional, Union
+from collections import defaultdict
+from typing import List, Optional, Sequence, Union
 from dataclasses import replace
 
 import ctranslate2
@@ -17,6 +18,9 @@ from whisperx.vads import Vad, Silero, Pyannote
 from whisperx.log_utils import get_logger
 
 logger = get_logger(__name__)
+
+# Languages that automatic per-segment language detection is allowed to pick between.
+DEFAULT_LANGUAGE_CANDIDATES = ("en", "ko")
 
 
 def find_numeral_symbol_tokens(tokenizer):
@@ -206,6 +210,7 @@ class FasterWhisperPipeline(Pipeline):
         combined_progress=False,
         verbose=False,
         progress_callback: ProgressCallback = None,
+        language_candidates: Optional[Sequence[str]] = None,
     ) -> TranscriptionResult:
         if isinstance(audio, str):
             audio = load_audio(audio)
@@ -217,7 +222,7 @@ class FasterWhisperPipeline(Pipeline):
                 # print(f2-f1)
                 yield {'inputs': audio[f1:f2]}
 
-        # Pre-process audio and merge chunks as defined by the respective VAD child class 
+        # Pre-process audio and merge chunks as defined by the respective VAD child class
         # In case vad_model is manually assigned (see 'load_model') follow the functionality of pyannote toolkit
         if issubclass(type(self.vad_model), Vad):
             waveform = self.vad_model.preprocess_audio(audio)
@@ -233,25 +238,44 @@ class FasterWhisperPipeline(Pipeline):
             onset=self._vad_params["vad_onset"],
             offset=self._vad_params["vad_offset"],
         )
-        if self.tokenizer is None:
-            language = language or self.detect_language(audio)
-            task = task or "transcribe"
-            self.tokenizer = Tokenizer(
-                self.model.hf_tokenizer,
-                self.model.model.is_multilingual,
-                task=task,
-                language=language,
-            )
+
+        task = task or (self.tokenizer.task if self.tokenizer is not None else "transcribe")
+        batch_size = batch_size or self._batch_size
+        total_segments = len(vad_segments)
+
+        if language is not None or self.preset_language is not None:
+            # A language was explicitly pinned (either for this call or when the
+            # pipeline/model was loaded) -> use it for every segment, as before.
+            language = language or self.preset_language or self.tokenizer.language_code
+            segment_languages = [language] * total_segments
         else:
-            language = language or self.tokenizer.language_code
-            task = task or self.tokenizer.task
-            if task != self.tokenizer.task or language != self.tokenizer.language_code:
-                self.tokenizer = Tokenizer(
-                    self.model.hf_tokenizer,
-                    self.model.model.is_multilingual,
-                    task=task,
-                    language=language,
+            # No language pinned: detect the language of each VAD segment on its
+            # own, restricted to `language_candidates` (defaults to en/ko).
+            candidates = tuple(language_candidates or DEFAULT_LANGUAGE_CANDIDATES)
+            segment_languages = []
+            for seg in vad_segments:
+                f1 = int(seg['start'] * SAMPLE_RATE)
+                f2 = int(seg['end'] * SAMPLE_RATE)
+                segment_languages.append(
+                    self.detect_segment_language(audio[f1:f2], candidates=candidates)
                 )
+
+        # Group segment indices by detected/pinned language, preserving each
+        # segment's original position in `vad_segments` so results can be
+        # reassembled in the original order after decoding.
+        language_to_indices: dict = defaultdict(list)
+        for idx, lang in enumerate(segment_languages):
+            language_to_indices[lang].append(idx)
+
+        # Build a tokenizer once up front (any language works structurally) so
+        # suppress_numerals can inspect its vocabulary before we start decoding.
+        first_language = segment_languages[0] if segment_languages else (language or DEFAULT_LANGUAGE_CANDIDATES[0])
+        self.tokenizer = Tokenizer(
+            self.model.hf_tokenizer,
+            self.model.model.is_multilingual,
+            task=task,
+            language=first_language,
+        )
 
         if self.suppress_numerals:
             previous_suppress_tokens = self.options.suppress_tokens
@@ -261,31 +285,51 @@ class FasterWhisperPipeline(Pipeline):
             new_suppressed_tokens = list(set(new_suppressed_tokens))
             self.options = replace(self.options, suppress_tokens=new_suppressed_tokens)
 
-        segments: List[SingleSegment] = []
-        batch_size = batch_size or self._batch_size
-        total_segments = len(vad_segments)
-        for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
-            if print_progress:
-                base_progress = ((idx + 1) / total_segments) * 100
-                percent_complete = base_progress / 2 if combined_progress else base_progress
-                print(f"Progress: {percent_complete:.2f}%...")
-            if progress_callback is not None:
-                progress_callback(((idx + 1) / total_segments) * 100)
-            text = out['text']
-            avg_logprob = out['avg_logprob']
-            if batch_size in [0, 1, None]:
-                text = text[0]
-                avg_logprob = avg_logprob[0]
-            if verbose:
-                print(f"Transcript: [{round(vad_segments[idx]['start'], 3)} --> {round(vad_segments[idx]['end'], 3)}] {text}")
-            segments.append(
-                {
+        results_by_index: dict = {}
+        processed = 0
+        # Decode segments grouped by language, so each group is batched/merged
+        # together and only needs one tokenizer swap.
+        for lang in sorted(language_to_indices.keys()):
+            indices = language_to_indices[lang]
+            group_segments = [vad_segments[i] for i in indices]
+
+            if self.tokenizer.language_code != lang or self.tokenizer.task != task:
+                self.tokenizer = Tokenizer(
+                    self.model.hf_tokenizer,
+                    self.model.model.is_multilingual,
+                    task=task,
+                    language=lang,
+                )
+
+            for local_idx, out in enumerate(
+                self.__call__(data(audio, group_segments), batch_size=batch_size, num_workers=num_workers)
+            ):
+                original_idx = indices[local_idx]
+                processed += 1
+                if print_progress:
+                    base_progress = (processed / total_segments) * 100
+                    percent_complete = base_progress / 2 if combined_progress else base_progress
+                    print(f"Progress: {percent_complete:.2f}%...")
+                if progress_callback is not None:
+                    progress_callback((processed / total_segments) * 100)
+                text = out['text']
+                avg_logprob = out['avg_logprob']
+                if batch_size in [0, 1, None]:
+                    text = text[0]
+                    avg_logprob = avg_logprob[0]
+                seg = vad_segments[original_idx]
+                if verbose:
+                    print(f"Transcript: [{round(seg['start'], 3)} --> {round(seg['end'], 3)}] ({lang}) {text}")
+                results_by_index[original_idx] = {
                     "text": text,
-                    "start": round(vad_segments[idx]['start'], 3),
-                    "end": round(vad_segments[idx]['end'], 3),
+                    "start": round(seg['start'], 3),
+                    "end": round(seg['end'], 3),
                     "avg_logprob": avg_logprob,
+                    "language": lang,
                 }
-            )
+
+        # Reassemble the decoded segments in the original vad_segments order.
+        segments: List[SingleSegment] = [results_by_index[i] for i in range(total_segments)]
 
         # revert the tokenizer if multilingual inference is enabled
         if self.preset_language is None:
@@ -295,7 +339,57 @@ class FasterWhisperPipeline(Pipeline):
         if self.suppress_numerals:
             self.options = replace(self.options, suppress_tokens=previous_suppress_tokens)
 
-        return {"segments": segments, "language": language}
+        # Report the majority language across segments as the overall result
+        # language, for backwards compatibility with callers expecting a single
+        # language string (each segment also carries its own "language" key).
+        if segment_languages:
+            language_counts = defaultdict(int)
+            for lang in segment_languages:
+                language_counts[lang] += 1
+            overall_language = max(language_counts.items(), key=lambda item: item[1])[0]
+        else:
+            overall_language = language
+
+        return {"segments": segments, "language": overall_language}
+
+    def detect_segment_language(
+        self,
+        audio_segment: np.ndarray,
+        candidates: Sequence[str] = DEFAULT_LANGUAGE_CANDIDATES,
+    ) -> str:
+        """Detect the language of a single (short) audio segment.
+
+        Unlike `detect_language`, which picks freely among every language the
+        model supports, this restricts the choice to `candidates` (e.g. only
+        Korean/English) and returns whichever of them scores highest.
+        """
+        if not candidates:
+            raise ValueError("candidates must be a non-empty sequence of language codes")
+
+        model_n_mels = self.model.feat_kwargs.get("feature_size")
+        clipped = audio_segment[:N_SAMPLES]
+        segment = log_mel_spectrogram(
+            clipped,
+            n_mels=model_n_mels if model_n_mels is not None else 80,
+            padding=max(0, N_SAMPLES - clipped.shape[0]),
+        )
+        encoder_output = self.model.encode(segment)
+        results = self.model.model.detect_language(encoder_output)[0]
+
+        candidate_set = set(candidates)
+        candidate_probs = {
+            token[2:-2]: prob for token, prob in results if token[2:-2] in candidate_set
+        }
+        if not candidate_probs:
+            logger.warning(
+                f"None of the candidate languages {candidates} were reported by the model; "
+                f"defaulting to '{candidates[0]}'"
+            )
+            return candidates[0]
+
+        language = max(candidate_probs, key=candidate_probs.get)
+        logger.debug(f"Detected segment language: {language} ({candidate_probs[language]:.2f})")
+        return language
 
     def detect_language(self, audio: np.ndarray) -> str:
         if audio.shape[0] < N_SAMPLES:
