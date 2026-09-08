@@ -158,6 +158,39 @@ https://user-images.githubusercontent.com/36994049/208298811-e36002ba-3698-4731-
 
 See more examples in other languages [here](EXAMPLES.md).
 
+## Korean/English code-switching
+
+Use Whisper encoder language identification (LID) to split speech inside VAD
+regions, merge only adjacent regions with the same language, and decode every
+merged region with the matching Whisper language token:
+
+```bash
+whisperx audio.wav --model large-v3 --multilingual_lid --lid_languages ko,en --no_align
+```
+
+The default LID window is 3 seconds. Smaller values detect faster language
+switches but may be less reliable. JSON output includes `language` and
+`language_probability` on every decoded segment. Mixed-language forced
+alignment is not currently supported, so the CLI disables alignment when
+`--multilingual_lid` is enabled.
+
+Python API:
+
+```python
+model = whisperx.load_model(
+    "large-v3",
+    "cuda",
+    multilingual_lid=True,
+    lid_options={
+        "languages": ("ko", "en"),
+        "window_size": 3.0,
+        "probability_threshold": 0.5,
+        "max_merge_gap": 0.4,
+    },
+)
+result = model.transcribe(audio, batch_size=8, chunk_size=30)
+```
+
 ## Python usage 🐍
 
 ```python
