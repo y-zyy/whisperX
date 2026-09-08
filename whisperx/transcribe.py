@@ -56,6 +56,21 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     vad_offset: float = args.pop("vad_offset")
 
     chunk_size: int = args.pop("chunk_size")
+    multilingual_lid: bool = args.pop("multilingual_lid")
+    lid_languages = tuple(
+        code.strip().lower()
+        for code in args.pop("lid_languages").split(",")
+        if code.strip()
+    )
+    lid_window_size: float = args.pop("lid_window_size")
+    lid_probability_threshold: float = args.pop("lid_probability_threshold")
+    lid_max_merge_gap: float = args.pop("lid_max_merge_gap")
+    if multilingual_lid and not no_align:
+        warnings.warn(
+            "Mixed-language forced alignment is not yet supported; "
+            "disabling alignment for --multilingual_lid."
+        )
+        no_align = True
 
     diarize: bool = args.pop("diarize")
     min_speakers: int = args.pop("min_speakers")
@@ -142,6 +157,13 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
         local_files_only=model_cache_only,
         threads=faster_whisper_threads,
         use_auth_token=hf_token,
+        multilingual_lid=multilingual_lid,
+        lid_options={
+            "languages": lid_languages,
+            "window_size": lid_window_size,
+            "probability_threshold": lid_probability_threshold,
+            "max_merge_gap": lid_max_merge_gap,
+        },
     )
 
     for audio_path in args.pop("audio"):
@@ -234,5 +256,6 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             results.append((result, input_audio_path))
     # >> Write
     for result, audio_path in results:
-        result["language"] = align_language
+        if not multilingual_lid:
+            result["language"] = align_language
         writer(result, audio_path, writer_args)
