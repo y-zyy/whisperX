@@ -102,6 +102,70 @@ def _smooth_language_predictions(
             smoothed[index] = (previous[0], max(previous[1], following[1]))
     return smoothed
 
+
+def suppress_short_language_runs(
+    segments: List[dict],
+    min_duration: float,
+    max_gap: float = 0.4,
+) -> List[dict]:
+    """Absorb short language runs into surrounding context.
+
+    A short isolated VAD region is preserved when no neighbour is close enough;
+    this avoids discarding a genuine short utterance after a long silence.
+    """
+    if min_duration <= 0 or len(segments) < 2:
+        return segments
+
+    runs = merge_language_segments(
+        segments,
+        chunk_size=float("inf"),
+        max_gap=max_gap,
+    )
+
+    while len(runs) > 1:
+        changed = False
+        for index, run in enumerate(runs):
+            if run["end"] - run["start"] >= min_duration:
+                continue
+
+            neighbours = []
+            if index > 0 and run["start"] - runs[index - 1]["end"] <= max_gap:
+                neighbours.append(runs[index - 1])
+            if (
+                index + 1 < len(runs)
+                and runs[index + 1]["start"] - run["end"] <= max_gap
+            ):
+                neighbours.append(runs[index + 1])
+            if not neighbours:
+                continue
+
+            languages = {neighbour["language"] for neighbour in neighbours}
+            if len(languages) == 1:
+                replacement_language = neighbours[0]["language"]
+            else:
+                strongest_neighbour = max(
+                    neighbours,
+                    key=lambda neighbour: (
+                        neighbour["end"] - neighbour["start"]
+                    ) * neighbour.get("language_probability", 0.0),
+                )
+                replacement_language = strongest_neighbour["language"]
+
+            run["language"] = replacement_language
+            runs = merge_language_segments(
+                runs,
+                chunk_size=float("inf"),
+                max_gap=max_gap,
+            )
+            changed = True
+            break
+
+        if not changed:
+            break
+
+    return runs
+
+
 class WhisperModel(faster_whisper.WhisperModel):
     '''
     FasterWhisperModel provides batched inference for faster-whisper.
@@ -210,6 +274,7 @@ class FasterWhisperPipeline(Pipeline):
             "languages": ("ko", "en"),
             "window_size": 3.0,
             "probability_threshold": 0.5,
+            "min_language_duration": 3.0,
             "max_merge_gap": 0.4,
         }
         if lid_options is not None:
@@ -481,6 +546,7 @@ class FasterWhisperPipeline(Pipeline):
         languages = tuple(self.lid_options["languages"])
         window_size = float(self.lid_options["window_size"])
         probability_threshold = float(self.lid_options["probability_threshold"])
+        min_language_duration = float(self.lid_options["min_language_duration"])
         max_merge_gap = float(self.lid_options["max_merge_gap"])
         if window_size <= 0:
             raise ValueError("lid window_size must be greater than zero")
@@ -541,8 +607,13 @@ class FasterWhisperPipeline(Pipeline):
                     }
                 )
 
-        return merge_language_segments(
+        stable_runs = suppress_short_language_runs(
             labeled_pieces,
+            min_duration=min_language_duration,
+            max_gap=max_merge_gap,
+        )
+        return merge_language_segments(
+            stable_runs,
             chunk_size=chunk_size,
             max_gap=max_merge_gap,
         )
