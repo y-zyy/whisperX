@@ -501,7 +501,7 @@ class FasterWhisperPipeline(Pipeline):
                     np.arange(start + window_size / 2, end, window_size)
                 )
                 final_center = end - window_size / 2
-                if not centers or final_center - centers[-1] > window_size / 2:
+                if not centers or final_center > centers[-1] + 1e-6:
                     centers.append(final_center)
 
             predictions: List[Tuple[str, float]] = []
