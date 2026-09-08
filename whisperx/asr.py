@@ -335,6 +335,7 @@ class FasterWhisperPipeline(Pipeline):
                     if segment["language"] == code
                 ),
             )
+            self.tokenizer = self._make_tokenizer(language, task)
         else:
             vad_segments = merge_chunks(
                 raw_vad_segments,
