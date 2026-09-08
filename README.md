@@ -169,8 +169,11 @@ whisperx audio.wav --model large-v3 --multilingual_lid --lid_languages ko,en --n
 ```
 
 The default LID window is 3 seconds. Smaller values detect faster language
-switches but may be less reliable. JSON output includes `language` and
-`language_probability` on every decoded segment. Mixed-language forced
+switches but may be less reliable. Language runs shorter than 3 seconds are
+absorbed into nearby language context by default, preventing isolated English
+words in Korean speech (and vice versa) from creating a new decode segment.
+Override this with `--lid_min_language_duration`. JSON output includes
+`language` and `language_probability` on every decoded segment. Mixed-language forced
 alignment is not currently supported, so the CLI disables alignment when
 `--multilingual_lid` is enabled.
 
@@ -185,6 +188,7 @@ model = whisperx.load_model(
         "languages": ("ko", "en"),
         "window_size": 3.0,
         "probability_threshold": 0.5,
+        "min_language_duration": 3.0,
         "max_merge_gap": 0.4,
     },
 )
