@@ -103,6 +103,16 @@ def _smooth_language_predictions(
     return smoothed
 
 
+def _speech_duration(segment: dict) -> float:
+    return sum(
+        end - start
+        for start, end in segment.get(
+            "segments",
+            [(segment["start"], segment["end"])],
+        )
+    )
+
+
 def suppress_short_language_runs(
     segments: List[dict],
     min_duration: float,
@@ -125,7 +135,7 @@ def suppress_short_language_runs(
     while len(runs) > 1:
         changed = False
         for index, run in enumerate(runs):
-            if run["end"] - run["start"] >= min_duration:
+            if _speech_duration(run) >= min_duration:
                 continue
 
             neighbours = []
@@ -145,9 +155,8 @@ def suppress_short_language_runs(
             else:
                 strongest_neighbour = max(
                     neighbours,
-                    key=lambda neighbour: (
-                        neighbour["end"] - neighbour["start"]
-                    ) * neighbour.get("language_probability", 0.0),
+                    key=lambda neighbour: _speech_duration(neighbour)
+                    * neighbour.get("language_probability", 0.0),
                 )
                 replacement_language = strongest_neighbour["language"]
 
