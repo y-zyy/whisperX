@@ -64,6 +64,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     )
     lid_window_size: float = args.pop("lid_window_size")
     lid_probability_threshold: float = args.pop("lid_probability_threshold")
+    lid_min_language_duration: float = args.pop("lid_min_language_duration")
     lid_max_merge_gap: float = args.pop("lid_max_merge_gap")
     if multilingual_lid and not no_align:
         warnings.warn(
@@ -162,6 +163,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
             "languages": lid_languages,
             "window_size": lid_window_size,
             "probability_threshold": lid_probability_threshold,
+            "min_language_duration": lid_min_language_duration,
             "max_merge_gap": lid_max_merge_gap,
         },
     )
