@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 from dataclasses import replace
 
 import ctranslate2
@@ -27,6 +27,80 @@ def find_numeral_symbol_tokens(tokenizer):
         if has_numeral_symbol:
             numeral_symbol_tokens.append(i)
     return numeral_symbol_tokens
+
+
+def merge_language_segments(
+    segments: List[dict],
+    chunk_size: float,
+    max_gap: float = 0.4,
+) -> List[dict]:
+    """Merge adjacent VAD/LID pieces only when they have the same language."""
+    if not segments:
+        return []
+
+    merged: List[dict] = []
+    current = {
+        "start": segments[0]["start"],
+        "end": segments[0]["end"],
+        "language": segments[0]["language"],
+        "language_probability": segments[0].get("language_probability", 0.0),
+        "segments": list(segments[0].get("segments", [(segments[0]["start"], segments[0]["end"])])),
+    }
+    probability_weight = current["end"] - current["start"]
+
+    for segment in segments[1:]:
+        gap = segment["start"] - current["end"]
+        combined_duration = segment["end"] - current["start"]
+        same_language = segment["language"] == current["language"]
+        if same_language and gap <= max_gap and combined_duration <= chunk_size:
+            duration = segment["end"] - segment["start"]
+            total_weight = probability_weight + duration
+            if total_weight > 0:
+                current["language_probability"] = (
+                    current["language_probability"] * probability_weight
+                    + segment.get("language_probability", 0.0) * duration
+                ) / total_weight
+            probability_weight = total_weight
+            current["end"] = segment["end"]
+            current["segments"].extend(
+                segment.get("segments", [(segment["start"], segment["end"])])
+            )
+        else:
+            merged.append(current)
+            current = {
+                "start": segment["start"],
+                "end": segment["end"],
+                "language": segment["language"],
+                "language_probability": segment.get("language_probability", 0.0),
+                "segments": list(segment.get("segments", [(segment["start"], segment["end"])])),
+            }
+            probability_weight = current["end"] - current["start"]
+
+    merged.append(current)
+    return merged
+
+
+def _smooth_language_predictions(
+    predictions: List[Tuple[str, float]],
+    probability_threshold: float,
+) -> List[Tuple[str, float]]:
+    """Remove a single low-confidence language island between matching neighbours."""
+    if len(predictions) < 3:
+        return predictions
+
+    smoothed = list(predictions)
+    for index in range(1, len(predictions) - 1):
+        previous, current, following = predictions[index - 1:index + 2]
+        if (
+            previous[0] == following[0]
+            and current[0] != previous[0]
+            and (
+                current[1] < probability_threshold
+                or current[1] < min(previous[1], following[1])
+            )
+        ):
+            smoothed[index] = (previous[0], max(previous[1], following[1]))
+    return smoothed
 
 class WhisperModel(faster_whisper.WhisperModel):
     '''
@@ -122,6 +196,8 @@ class FasterWhisperPipeline(Pipeline):
         framework="pt",
         language: Optional[str] = None,
         suppress_numerals: bool = False,
+        multilingual_lid: bool = False,
+        lid_options: Optional[dict] = None,
         **kwargs,
     ):
         self.model = model
@@ -129,6 +205,15 @@ class FasterWhisperPipeline(Pipeline):
         self.options = options
         self.preset_language = language
         self.suppress_numerals = suppress_numerals
+        self.multilingual_lid = multilingual_lid
+        self.lid_options = {
+            "languages": ("ko", "en"),
+            "window_size": 3.0,
+            "probability_threshold": 0.5,
+            "max_merge_gap": 0.4,
+        }
+        if lid_options is not None:
+            self.lid_options.update(lid_options)
         self._batch_size = kwargs.pop("batch_size", None)
         self._num_workers = 1
         self._preprocess_params, self._forward_params, self._postprocess_params = self._sanitize_parameters(**kwargs)
@@ -226,32 +311,44 @@ class FasterWhisperPipeline(Pipeline):
             waveform = Pyannote.preprocess_audio(audio)
             merge_chunks = Pyannote.merge_chunks
 
-        vad_segments = self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
-        vad_segments = merge_chunks(
-            vad_segments,
-            chunk_size,
-            onset=self._vad_params["vad_onset"],
-            offset=self._vad_params["vad_offset"],
+        raw_vad_segments = list(
+            self.vad_model({"waveform": waveform, "sample_rate": SAMPLE_RATE})
         )
-        if self.tokenizer is None:
-            language = language or self.detect_language(audio)
-            task = task or "transcribe"
-            self.tokenizer = Tokenizer(
-                self.model.hf_tokenizer,
-                self.model.model.is_multilingual,
-                task=task,
-                language=language,
+        task = task or (self.tokenizer.task if self.tokenizer is not None else "transcribe")
+        original_tokenizer = self.tokenizer
+
+        if self.multilingual_lid:
+            if not self.model.model.is_multilingual:
+                raise ValueError("multilingual_lid requires a multilingual Whisper model")
+            vad_segments = self.split_vad_segments_by_language(
+                audio,
+                raw_vad_segments,
+                chunk_size=chunk_size,
+            )
+            if not vad_segments:
+                return {"segments": [], "language": language or self.lid_options["languages"][0]}
+            language = max(
+                self.lid_options["languages"],
+                key=lambda code: sum(
+                    segment["end"] - segment["start"]
+                    for segment in vad_segments
+                    if segment["language"] == code
+                ),
             )
         else:
-            language = language or self.tokenizer.language_code
-            task = task or self.tokenizer.task
-            if task != self.tokenizer.task or language != self.tokenizer.language_code:
-                self.tokenizer = Tokenizer(
-                    self.model.hf_tokenizer,
-                    self.model.model.is_multilingual,
-                    task=task,
-                    language=language,
-                )
+            vad_segments = merge_chunks(
+                raw_vad_segments,
+                chunk_size,
+                onset=self._vad_params["vad_onset"],
+                offset=self._vad_params["vad_offset"],
+            )
+            if self.tokenizer is None:
+                language = language or self.detect_language(audio)
+                self.tokenizer = self._make_tokenizer(language, task)
+            else:
+                language = language or self.tokenizer.language_code
+                if task != self.tokenizer.task or language != self.tokenizer.language_code:
+                    self.tokenizer = self._make_tokenizer(language, task)
 
         if self.suppress_numerals:
             previous_suppress_tokens = self.options.suppress_tokens
@@ -264,32 +361,62 @@ class FasterWhisperPipeline(Pipeline):
         segments: List[SingleSegment] = []
         batch_size = batch_size or self._batch_size
         total_segments = len(vad_segments)
-        for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
-            if print_progress:
-                base_progress = ((idx + 1) / total_segments) * 100
-                percent_complete = base_progress / 2 if combined_progress else base_progress
-                print(f"Progress: {percent_complete:.2f}%...")
-            if progress_callback is not None:
-                progress_callback(((idx + 1) / total_segments) * 100)
-            text = out['text']
-            avg_logprob = out['avg_logprob']
+        decoded: List[Optional[dict]] = [None] * total_segments
+
+        language_groups: Dict[str, List[int]] = {}
+        for index, segment in enumerate(vad_segments):
+            segment_language = segment.get("language", language)
+            language_groups.setdefault(segment_language, []).append(index)
+
+        completed = 0
+        for segment_language, indexes in language_groups.items():
+            self.tokenizer = self._make_tokenizer(segment_language, task)
+            grouped_segments = [vad_segments[index] for index in indexes]
+            iterator = self.__call__(
+                data(audio, grouped_segments),
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+            for local_index, out in enumerate(iterator):
+                decoded[indexes[local_index]] = out
+                completed += 1
+                if print_progress:
+                    base_progress = (completed / total_segments) * 100
+                    percent_complete = base_progress / 2 if combined_progress else base_progress
+                    print(f"Progress: {percent_complete:.2f}%...")
+                if progress_callback is not None:
+                    progress_callback((completed / total_segments) * 100)
+
+        for idx, out in enumerate(decoded):
+            if out is None:
+                raise RuntimeError(f"Missing decoder output for segment {idx}")
+            text = out["text"]
+            avg_logprob = out["avg_logprob"]
             if batch_size in [0, 1, None]:
                 text = text[0]
                 avg_logprob = avg_logprob[0]
+            segment_language = vad_segments[idx].get("language", language)
             if verbose:
-                print(f"Transcript: [{round(vad_segments[idx]['start'], 3)} --> {round(vad_segments[idx]['end'], 3)}] {text}")
-            segments.append(
-                {
-                    "text": text,
-                    "start": round(vad_segments[idx]['start'], 3),
-                    "end": round(vad_segments[idx]['end'], 3),
-                    "avg_logprob": avg_logprob,
-                }
-            )
+                print(
+                    f"Transcript ({segment_language}): "
+                    f"[{round(vad_segments[idx]['start'], 3)} --> "
+                    f"{round(vad_segments[idx]['end'], 3)}] {text}"
+                )
+            output_segment: SingleSegment = {
+                "text": text,
+                "start": round(vad_segments[idx]["start"], 3),
+                "end": round(vad_segments[idx]["end"], 3),
+                "avg_logprob": avg_logprob,
+            }
+            if self.multilingual_lid:
+                output_segment["language"] = segment_language
+                output_segment["language_probability"] = vad_segments[idx].get(
+                    "language_probability", 0.0
+                )
+            segments.append(output_segment)
 
-        # revert the tokenizer if multilingual inference is enabled
-        if self.preset_language is None:
-            self.tokenizer = None
+        # Restore the tokenizer selected at model construction time.
+        self.tokenizer = original_tokenizer
 
         # revert suppressed tokens if suppress_numerals is enabled
         if self.suppress_numerals:
@@ -297,19 +424,127 @@ class FasterWhisperPipeline(Pipeline):
 
         return {"segments": segments, "language": language}
 
-    def detect_language(self, audio: np.ndarray) -> str:
-        if audio.shape[0] < N_SAMPLES:
+    def _make_tokenizer(self, language: str, task: str) -> Tokenizer:
+        return Tokenizer(
+            self.model.hf_tokenizer,
+            self.model.model.is_multilingual,
+            task=task,
+            language=language,
+        )
+
+    def detect_language(
+        self,
+        audio: np.ndarray,
+        allowed_languages: Optional[Sequence[str]] = None,
+        return_probability: bool = False,
+    ) -> Union[str, Tuple[str, float]]:
+        if audio.shape[0] < N_SAMPLES and allowed_languages is None:
             logger.warning("Audio is shorter than 30s, language detection may be inaccurate")
         model_n_mels = self.model.feat_kwargs.get("feature_size")
-        segment = log_mel_spectrogram(audio[: N_SAMPLES],
-                                      n_mels=model_n_mels if model_n_mels is not None else 80,
-                                      padding=0 if audio.shape[0] >= N_SAMPLES else N_SAMPLES - audio.shape[0])
+        segment = log_mel_spectrogram(
+            audio[:N_SAMPLES],
+            n_mels=model_n_mels if model_n_mels is not None else 80,
+            padding=max(0, N_SAMPLES - audio.shape[0]),
+        )
         encoder_output = self.model.encode(segment)
-        results = self.model.model.detect_language(encoder_output)
-        language_token, language_probability = results[0][0]
+        candidates = self.model.model.detect_language(encoder_output)[0]
+        if allowed_languages is not None:
+            allowed = set(allowed_languages)
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate[0][2:-2] in allowed
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"Whisper returned none of the requested LID languages: {sorted(allowed)}"
+                )
+        language_token, language_probability = max(candidates, key=lambda item: item[1])
         language = language_token[2:-2]
-        logger.info(f"Detected language: {language} ({language_probability:.2f}) in first 30s of audio")
+        if allowed_languages is None:
+            logger.info(
+                f"Detected language: {language} ({language_probability:.2f}) "
+                "in first 30s of audio"
+            )
+        if return_probability:
+            return language, language_probability
         return language
+
+    def split_vad_segments_by_language(
+        self,
+        audio: np.ndarray,
+        vad_segments,
+        chunk_size: float,
+    ) -> List[dict]:
+        """Split VAD speech at Whisper-encoder LID changes and merge equal languages."""
+        languages = tuple(self.lid_options["languages"])
+        window_size = float(self.lid_options["window_size"])
+        probability_threshold = float(self.lid_options["probability_threshold"])
+        max_merge_gap = float(self.lid_options["max_merge_gap"])
+        if window_size <= 0:
+            raise ValueError("lid window_size must be greater than zero")
+        if len(languages) < 2:
+            raise ValueError("lid languages must contain at least two language codes")
+
+        labeled_pieces: List[dict] = []
+        for vad_segment in vad_segments:
+            start, end = float(vad_segment.start), float(vad_segment.end)
+            duration = end - start
+            if duration <= 0:
+                continue
+
+            if duration <= window_size:
+                centers = [(start + end) / 2]
+            else:
+                centers = list(
+                    np.arange(start + window_size / 2, end, window_size)
+                )
+                final_center = end - window_size / 2
+                if not centers or final_center - centers[-1] > window_size / 2:
+                    centers.append(final_center)
+
+            predictions: List[Tuple[str, float]] = []
+            for center in centers:
+                probe_start = max(start, min(center - window_size / 2, end - window_size))
+                probe_end = min(end, probe_start + window_size)
+                f1 = max(0, int(probe_start * SAMPLE_RATE))
+                f2 = min(audio.shape[0], int(probe_end * SAMPLE_RATE))
+                predictions.append(
+                    self.detect_language(
+                        audio[f1:f2],
+                        allowed_languages=languages,
+                        return_probability=True,
+                    )
+                )
+
+            predictions = _smooth_language_predictions(
+                predictions,
+                probability_threshold=probability_threshold,
+            )
+            boundaries = [start]
+            boundaries.extend(
+                (centers[index - 1] + centers[index]) / 2
+                for index in range(1, len(centers))
+            )
+            boundaries.append(end)
+
+            for index, (segment_language, probability) in enumerate(predictions):
+                piece_start, piece_end = boundaries[index], boundaries[index + 1]
+                labeled_pieces.append(
+                    {
+                        "start": piece_start,
+                        "end": piece_end,
+                        "language": segment_language,
+                        "language_probability": probability,
+                        "segments": [(piece_start, piece_end)],
+                    }
+                )
+
+        return merge_language_segments(
+            labeled_pieces,
+            chunk_size=chunk_size,
+            max_gap=max_merge_gap,
+        )
 
 
 def load_model(
@@ -328,6 +563,8 @@ def load_model(
     local_files_only=False,
     threads=4,
     use_auth_token: Optional[Union[str, bool]] = None,
+    multilingual_lid: bool = False,
+    lid_options: Optional[dict] = None,
 ) -> FasterWhisperPipeline:
     """Load a Whisper model for inference.
     Args:
@@ -439,4 +676,6 @@ def load_model(
         language=language,
         suppress_numerals=suppress_numerals,
         vad_params=default_vad_options,
+        multilingual_lid=multilingual_lid,
+        lid_options=lid_options,
     )
