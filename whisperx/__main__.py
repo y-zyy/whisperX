@@ -40,6 +40,11 @@ def cli():
     parser.add_argument("--vad_onset", type=float, default=0.500, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
     parser.add_argument("--vad_offset", type=float, default=0.363, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
     parser.add_argument("--chunk_size", type=int, default=30, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
+    parser.add_argument("--multilingual_lid", action="store_true", help="Split VAD speech with Whisper encoder LID and decode each segment with its own language token")
+    parser.add_argument("--lid_languages", type=str, default="ko,en", help="Comma-separated language codes considered by multilingual LID")
+    parser.add_argument("--lid_window_size", type=float, default=3.0, help="Seconds per Whisper encoder LID probe; language boundaries are resolved at roughly this interval")
+    parser.add_argument("--lid_probability_threshold", type=float, default=0.5, help="Confidence below which an isolated language prediction is smoothed")
+    parser.add_argument("--lid_max_merge_gap", type=float, default=0.4, help="Maximum silence gap in seconds when merging adjacent same-language pieces")
 
     # diarization params
     parser.add_argument("--diarize", action="store_true", help="Apply diarization to assign speaker labels to each segment/word")
