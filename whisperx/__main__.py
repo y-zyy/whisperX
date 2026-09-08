@@ -44,6 +44,7 @@ def cli():
     parser.add_argument("--lid_languages", type=str, default="ko,en", help="Comma-separated language codes considered by multilingual LID")
     parser.add_argument("--lid_window_size", type=float, default=3.0, help="Seconds per Whisper encoder LID probe; language boundaries are resolved at roughly this interval")
     parser.add_argument("--lid_probability_threshold", type=float, default=0.5, help="Confidence below which an isolated language prediction is smoothed")
+    parser.add_argument("--lid_min_language_duration", type=float, default=3.0, help="Absorb language runs shorter than this duration into nearby language context")
     parser.add_argument("--lid_max_merge_gap", type=float, default=0.4, help="Maximum silence gap in seconds when merging adjacent same-language pieces")
 
     # diarization params
