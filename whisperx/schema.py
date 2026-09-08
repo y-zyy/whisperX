@@ -36,6 +36,8 @@ class SingleSegment(TypedDict):
     end: float
     text: str
     avg_logprob: NotRequired[float]
+    language: NotRequired[str]
+    language_probability: NotRequired[float]
 
 
 class SegmentData(TypedDict):
