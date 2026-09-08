@@ -113,6 +113,13 @@ def _speech_duration(segment: dict) -> float:
     )
 
 
+def _speech_duration(segment: dict) -> float:
+    pieces = segment.get("segments")
+    if pieces:
+        return sum(end - start for start, end in pieces)
+    return segment["end"] - segment["start"]
+
+
 def suppress_short_language_runs(
     segments: List[dict],
     min_duration: float,
