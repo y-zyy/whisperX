@@ -110,3 +110,22 @@ def test_isolated_short_utterance_after_long_silence_is_preserved():
     )
 
     assert [item["language"] for item in stable] == ["ko", "en"]
+
+
+def test_minimum_duration_excludes_short_silence_inside_language_run():
+    segments = [
+        _segment(0.0, 4.0, "ko"),
+        _segment(4.0, 5.4, "en"),
+        _segment(5.7, 7.1, "en"),
+        _segment(7.1, 11.0, "ko"),
+    ]
+
+    stable = suppress_short_language_runs(
+        segments,
+        min_duration=3.0,
+        max_gap=0.4,
+    )
+
+    assert [(item["start"], item["end"], item["language"]) for item in stable] == [
+        (0.0, 11.0, "ko"),
+    ]
