@@ -113,7 +113,9 @@ You may also need to install ffmpeg, rust etc. Follow openAI instructions here h
 
 ### Speaker Diarization
 
-To **enable Speaker Diarization**, include your Hugging Face access token (read) that you can generate from [Here](https://huggingface.co/settings/tokens) after the `--hf_token` argument and accept the user agreement for the [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) model.
+The default diarization model in this fork is [BUT-FIT/diarizen-wavlm-large-s80-md](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md). Install [DiariZen and its compatible pyannote-audio fork](https://github.com/BUTSpeechFIT/DiariZen#installation) before enabling diarization. A Hugging Face read token can be supplied with `--hf_token` or `HF_TOKEN`.
+
+> **License:** DiariZen model weights are CC BY-NC 4.0 and are intended for non-commercial use. DiariZen currently does not expose representative speaker embeddings, so `--speaker_embeddings` returns no embeddings with this backend.
 
 <h2 align="left" id="example">Usage 💬 (command line)</h2>
 
@@ -163,6 +165,7 @@ See more examples in other languages [here](EXAMPLES.md).
 ```python
 import whisperx
 import gc
+import os
 from whisperx.diarize import DiarizationPipeline
 
 device = "cuda"
@@ -193,12 +196,22 @@ print(result["segments"]) # after alignment
 # delete model if low on GPU resources
 # import gc; import torch; gc.collect(); torch.cuda.empty_cache(); del model_a
 
-# 3. Assign speaker labels
-diarize_model = DiarizationPipeline(token=YOUR_HF_TOKEN, device=device)
+# 3. Assign speaker labels with the default DiariZen model
+# HF_TOKEN is optional for public files, but may be needed by downloaded dependencies.
+hf_token = os.getenv("HF_TOKEN")
+diarize_model = DiarizationPipeline(
+    model_name="BUT-FIT/diarizen-wavlm-large-s80-md",
+    token=hf_token,
+    device=device,
+)
 
-# add min/max number of speakers if known
-diarize_segments = diarize_model(audio)
-# diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
+# Pass the original path to avoid creating a temporary WAV. Set speaker bounds
+# when they are known; passing the already-loaded `audio` array also works.
+diarize_segments = diarize_model(
+    audio_file,
+    min_speakers=2,
+    max_speakers=6,
+)
 
 result = whisperx.assign_word_speakers(diarize_segments, result)
 print(diarize_segments)
